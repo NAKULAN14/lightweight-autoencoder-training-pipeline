@@ -1,0 +1,17 @@
+venv/
+.venv/
+
+__pycache__/
+*.pyc
+
+models/
+outputs/
+
+*.png
+*.h5
+
+data/processed/*.npy
+data/attacks/*.npy
+
+*.zip
+*.rar

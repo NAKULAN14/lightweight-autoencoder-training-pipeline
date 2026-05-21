@@ -1,16 +1,28 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
-
+from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.layers import (
+    Input,
+    Dense,
+    Dropout,
+    BatchNormalization,
+    LeakyReLU
+)
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from tensorflow.keras.optimizers import Adam
 
 from sklearn.metrics import (
     classification_report,
     roc_curve,
-    auc
+    auc,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    accuracy_score,
+    precision_score,
+    recall_score
 )
 
 # =========================================================
@@ -30,7 +42,19 @@ y_test_attack_labels = np.load(
 )
 
 print("Datasets loaded successfully.\n")
+# =========================================================
+# STANDARDIZE DATA
+# =========================================================
 
+print("Standardizing data...\n")
+
+scaler = StandardScaler()
+
+X_train = scaler.fit_transform(X_train)
+X_val = scaler.transform(X_val)
+
+X_test_benign = scaler.transform(X_test_benign)
+X_test_attacks = scaler.transform(X_test_attacks)
 # =========================================================
 # BUILD AUTOENCODER
 # =========================================================
@@ -41,17 +65,28 @@ input_dim = 115
 
 input_layer = Input(shape=(input_dim,))
 
+
 # Encoder
-x = Dense(64, activation='relu')(input_layer)
-x = Dense(32, activation='relu')(x)
-bottleneck = Dense(16, activation='relu')(x)
+x = Dense(48)(input_layer)
+x = BatchNormalization()(x)
+x = LeakyReLU(alpha=0.1)(x)
+x = Dropout(0.05)(x)
+
+x = Dense(16)(x)
+x = BatchNormalization()(x)
+x = LeakyReLU(alpha=0.1)(x)
+
+# Smaller bottleneck
+bottleneck = Dense(8)(x)
 
 # Decoder
-x = Dense(32, activation='relu')(bottleneck)
-x = Dense(64, activation='relu')(x)
+x = Dense(16)(bottleneck)
+x = LeakyReLU(alpha=0.1)(x)
 
-output_layer = Dense(input_dim, activation='sigmoid')(x)
+x = Dense(48)(x)
+x = LeakyReLU(alpha=0.1)(x)
 
+output_layer = Dense(input_dim, activation='linear')(x)
 # Create model
 autoencoder = Model(inputs=input_layer, outputs=output_layer)
 
@@ -60,8 +95,8 @@ autoencoder = Model(inputs=input_layer, outputs=output_layer)
 # =========================================================
 
 autoencoder.compile(
-    optimizer=Adam(learning_rate=0.001),
-    loss='mse'
+    optimizer=Adam(learning_rate=0.0005),
+    loss=tf.keras.losses.Huber()
 )
 
 autoencoder.summary()
@@ -77,7 +112,7 @@ early_stop = EarlyStopping(
 )
 
 checkpoint = ModelCheckpoint(
-    "models/lightweight_autoencoder.h5",
+    "models/lightweight_autoencoder.keras",
     monitor='val_loss',
     save_best_only=True
 )
@@ -95,8 +130,8 @@ history = autoencoder.fit(
 
     validation_data=(X_val, X_val),
 
-    epochs=50,
-    batch_size=256,
+    epochs=100,
+    batch_size=128,
 
     callbacks=[early_stop, checkpoint],
 
@@ -124,24 +159,73 @@ plt.savefig("outputs/training_loss.png")
 
 print("Training loss graph saved.\n")
 
-# =========================================================
-# COMPUTE VALIDATION RECONSTRUCTION ERROR
-# =========================================================
-
-print("Computing reconstruction errors...\n")
-
-val_reconstructions = autoencoder.predict(X_val)
-
-val_mse = np.mean(
-    np.square(X_val - val_reconstructions),
-    axis=1
-)
 
 # =========================================================
 # COMPUTE THRESHOLD
 # =========================================================
+# =========================================================
+# VALIDATION SPLIT FOR THRESHOLD OPTIMIZATION
+# =========================================================
 
-threshold = np.mean(val_mse) + 3 * np.std(val_mse)
+from sklearn.model_selection import train_test_split
+
+# Split validation benign data
+X_val_benign = X_val
+
+# Create validation attack subset
+X_val_attack, X_test_attacks_final = train_test_split(
+    X_test_attacks,
+    test_size=0.8,
+    random_state=42
+)
+
+# =========================================================
+# COMPUTE VALIDATION RECONSTRUCTION ERRORS
+# =========================================================
+
+val_benign_recon = autoencoder.predict(X_val_benign)
+
+val_benign_mse = np.mean(
+    np.square(X_val_benign - val_benign_recon),
+    axis=1
+)
+
+val_attack_recon = autoencoder.predict(X_val_attack)
+
+val_attack_mse = np.mean(
+    np.square(X_val_attack - val_attack_recon),
+    axis=1
+)
+# Combine
+y_val = np.concatenate([
+    np.zeros(len(val_benign_mse)),
+    np.ones(len(val_attack_mse))
+])
+
+val_scores = np.concatenate([
+    val_benign_mse,
+    val_attack_mse
+])
+
+# Find best threshold
+from sklearn.metrics import precision_recall_curve
+
+precision, recall, thresholds = precision_recall_curve(
+    y_val,
+    val_scores
+)
+
+f1_scores = (
+    2 * precision * recall
+    / (precision + recall + 1e-8)
+)
+
+best_idx = np.argmax(f1_scores)
+
+threshold = thresholds[best_idx]
+
+print(f"Optimized Threshold: {threshold}")
+print(f"Best F1 Score: {f1_scores[best_idx]}")
 
 print(f"Anomaly Threshold: {threshold}")
 
@@ -169,12 +253,13 @@ benign_mse = np.mean(
 
 print("Testing on attack traffic...\n")
 
-attack_recon = autoencoder.predict(X_test_attacks)
+attack_recon = autoencoder.predict(X_test_attacks_final)
 
 attack_mse = np.mean(
-    np.square(X_test_attacks - attack_recon),
+    np.square(X_test_attacks_final - attack_recon),
     axis=1
 )
+
 
 # =========================================================
 # CREATE LABELS
@@ -200,10 +285,41 @@ y_pred = (y_scores > threshold).astype(int)
 # CLASSIFICATION REPORT
 # =========================================================
 
-report = classification_report(y_true, y_pred)
+# =========================================================
+# METRICS
+# =========================================================
+
+accuracy = accuracy_score(y_true, y_pred)
+
+precision_metric = precision_score(y_true, y_pred)
+
+recall_metric = recall_score(y_true, y_pred)
+
+f1 = f1_score(y_true, y_pred)
+
+print("\n========================================")
+print("EVALUATION METRICS")
+print("========================================\n")
+
+print(f"Accuracy  : {accuracy:.6f}")
+print(f"Precision : {precision_metric:.6f}")
+print(f"Recall    : {recall_metric:.6f}")
+print(f"F1-Score  : {f1:.6f}")
+
+# Full classification report
+report = classification_report(
+    y_true,
+    y_pred,
+    digits=6
+)
 
 print("\nClassification Report:\n")
 print(report)
+
+cm = confusion_matrix(y_true, y_pred)
+
+print("\nConfusion Matrix:\n")
+print(cm)
 
 with open("outputs/evaluation_report.txt", "w") as f:
     f.write(report)
@@ -233,6 +349,17 @@ plt.savefig("outputs/roc_curve.png")
 
 print("ROC curve saved.\n")
 
+from sklearn.metrics import average_precision_score
+
+pr_auc = average_precision_score(
+    y_true,
+    y_scores
+)
+
+print(f"PR-AUC: {pr_auc:.4f}")
+f1 = f1_score(y_true, y_pred)
+
+print(f"F1-Score: {f1:.4f}")
 # =========================================================
 # HISTOGRAM
 # =========================================================
